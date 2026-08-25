@@ -16,6 +16,7 @@ from .base import MmprojModel, ModelBase, TextModel, gguf
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen2_5OmniModel",
+    "OmChatQwen25VLForCausalLM",
 )
 class Qwen2VLModel(TextModel):
     model_arch = gguf.MODEL_ARCH.QWEN2VL
@@ -33,13 +34,19 @@ class Qwen2VLModel(TextModel):
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
 
+        # VLM-FO1 stores its custom vision stack in the same safetensors
+        # index as the language model. Keep the text export usable until a
+        # dedicated VLM-FO1 projector is available.
+        if name.startswith(("model.vision_tower.", "model.vision_tower_aux.", "model.mm_projector_aux.", "model.object_vp_extractor.")):
+            return None
+
         if name.startswith("thinker."):
             name = name.replace("thinker.", "")
 
         return super().filter_tensors((name, gen))
 
 
-@ModelBase.register("Qwen2VLModel", "Qwen2VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration")
+@ModelBase.register("Qwen2VLModel", "Qwen2VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration", "OmChatQwen25VLForCausalLM")
 class Qwen2VLVisionModel(MmprojModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -59,7 +66,7 @@ class Qwen2VLVisionModel(MmprojModel):
         model_type = self.global_config['model_type']
         if model_type == 'qwen2_vl':
             self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN2VL)
-        elif model_type == 'qwen2_5_vl' or model_type == 'qwen2_5_omni':
+        elif model_type in ('qwen2_5_vl', 'qwen2_5_omni', 'omchat_qwen2_5_vl'):
             if model_type == 'qwen2_5_omni':
                 self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN25O)
             else:
@@ -88,10 +95,17 @@ class Qwen2VLVisionModel(MmprojModel):
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
 
+        # VLM-FO1 keeps the standard Qwen vision transformer below an
+        # additional model.vision_tower.image_tower wrapper.
+        if name.startswith("model.vision_tower.image_tower."):
+            name = name.replace("model.vision_tower.image_tower.", "visual.", 1)
+        else:
+            return None
+
         if not name.startswith("visual."):
             return None
 
-        return super().filter_tensors(item)
+        return super().filter_tensors((name, gen))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # split QKV tensors if needed

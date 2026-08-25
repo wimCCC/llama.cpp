@@ -942,6 +942,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_qwen2vl>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_VLM_FO1_AUX:
+            {
+                builder = std::make_unique<clip_graph_vlm_fo1_aux>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_QWEN3VL:
             {
                 builder = std::make_unique<clip_graph_qwen3vl>(ctx, img);
@@ -1110,6 +1114,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
     }
 
     builder->img_batch = &imgs;
+    builder->encode_params = params;
 
     // TODO [QWEN_VIDEO]: improve this in the future
     builder->n_batch = imgs.entries.size();
@@ -1626,6 +1631,15 @@ struct clip_model_loader {
                         get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
                         get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                    } break;
+                case PROJECTOR_TYPE_VLM_FO1_AUX:
+                    {
+                        // Auxiliary region tower is loaded separately from the primary Qwen-VL tower.
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC_PILLOW;
+                        hparams.image_resize_pad = PAD_NONE;
+                        get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
+                        get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
+                        get_u32("vlm_fo1.num_region_tokens", hparams.n_region_tokens, false);
                     } break;
                 case PROJECTOR_TYPE_STEP3VL:
                     {
@@ -2149,7 +2163,8 @@ struct clip_model_loader {
         const bool has_standard_layers = (
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
             model.proj_type != PROJECTOR_TYPE_QWEN3TTS_SPKENC &&
-            model.proj_type != PROJECTOR_TYPE_POCKETTTS_GEN);
+            model.proj_type != PROJECTOR_TYPE_POCKETTTS_GEN &&
+            model.proj_type != PROJECTOR_TYPE_VLM_FO1_AUX);
 
         // layers
         const int n_layers_to_load = has_standard_layers ? hparams.n_layer : 0;
@@ -2406,6 +2421,87 @@ struct clip_model_loader {
                     model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
                     model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                } break;
+            case PROJECTOR_TYPE_VLM_FO1_AUX:
+                {
+                    for (int i = 0; i < 4; ++i) {
+                        model.aux_conv_w.push_back(get_tensor(string_format("fo1.vt.convs.%d.proj.weight", i)));
+                        model.aux_conv_b.push_back(get_tensor(string_format("fo1.vt.convs.%d.proj.bias", i), false));
+                        model.aux_conv_norm_w.push_back(get_tensor(string_format("fo1.vt.convs.%d.norm.weight", i), false));
+                        model.aux_conv_norm_b.push_back(get_tensor(string_format("fo1.vt.convs.%d.norm.bias", i), false));
+                    }
+                    const int depths[] = { 1, 1, 9, 1 };
+                    for (int stage = 0; stage < 4; ++stage) {
+                        for (int block = 0; block < depths[stage]; ++block) {
+                            const std::string prefix = string_format("fo1.b%d.%d.", stage, block);
+                            clip_aux_davit_block layer;
+                            layer.channel_norm_w = get_tensor(string_format("%scnw", prefix.c_str()), false);
+                            layer.channel_norm_b = get_tensor(string_format("%scnb", prefix.c_str()), false);
+                            layer.channel_qkv_w = get_tensor(string_format("%scqw", prefix.c_str()), false);
+                            layer.channel_qkv_b = get_tensor(string_format("%scqb", prefix.c_str()), false);
+                            layer.channel_o_w = get_tensor(string_format("%scow", prefix.c_str()), false);
+                            layer.channel_o_b = get_tensor(string_format("%scob", prefix.c_str()), false);
+                            layer.channel_dw1_w = get_tensor(string_format("%scd1w", prefix.c_str()), false);
+                            layer.channel_dw1_b = get_tensor(string_format("%scd1b", prefix.c_str()), false);
+                            layer.channel_dw2_w = get_tensor(string_format("%scd2w", prefix.c_str()), false);
+                            layer.channel_dw2_b = get_tensor(string_format("%scd2b", prefix.c_str()), false);
+                            layer.channel_ffn_norm_w = get_tensor(string_format("%scfnw", prefix.c_str()), false);
+                            layer.channel_ffn_norm_b = get_tensor(string_format("%scfnb", prefix.c_str()), false);
+                            layer.channel_ffn_up_w = get_tensor(string_format("%scfuw", prefix.c_str()), false);
+                            layer.channel_ffn_up_b = get_tensor(string_format("%scfub", prefix.c_str()), false);
+                            layer.channel_ffn_down_w = get_tensor(string_format("%scfdw", prefix.c_str()), false);
+                            layer.channel_ffn_down_b = get_tensor(string_format("%scfdb", prefix.c_str()), false);
+                            layer.spatial_dw1_w = get_tensor(string_format("%ssd1w", prefix.c_str()), false);
+                            layer.spatial_dw1_b = get_tensor(string_format("%ssd1b", prefix.c_str()), false);
+                            layer.spatial_dw2_w = get_tensor(string_format("%ssd2w", prefix.c_str()), false);
+                            layer.spatial_dw2_b = get_tensor(string_format("%ssd2b", prefix.c_str()), false);
+                            layer.spatial_norm_w = get_tensor(string_format("%ssnw", prefix.c_str()));
+                            layer.spatial_norm_b = get_tensor(string_format("%ssnb", prefix.c_str()));
+                            layer.spatial_qkv_w = get_tensor(string_format("%ssqw", prefix.c_str()));
+                            layer.spatial_qkv_b = get_tensor(string_format("%ssqb", prefix.c_str()));
+                            layer.spatial_o_w = get_tensor(string_format("%ssow", prefix.c_str()));
+                            layer.spatial_o_b = get_tensor(string_format("%ssob", prefix.c_str()));
+                            layer.spatial_ffn_norm_w = get_tensor(string_format("%ssfnw", prefix.c_str()));
+                            layer.spatial_ffn_norm_b = get_tensor(string_format("%ssfnb", prefix.c_str()));
+                            layer.spatial_ffn_up_w = get_tensor(string_format("%ssfuw", prefix.c_str()));
+                            layer.spatial_ffn_up_b = get_tensor(string_format("%ssfub", prefix.c_str()));
+                            layer.spatial_ffn_down_w = get_tensor(string_format("%ssfdw", prefix.c_str()));
+                            layer.spatial_ffn_down_b = get_tensor(string_format("%ssfdb", prefix.c_str()));
+                            model.aux_davit_blocks.push_back(layer);
+                        }
+                    }
+                    model.aux_fpn_levels.resize(4);
+                    for (int level = 1; level <= 4; ++level) {
+                        const std::string prefix = string_format("fo1.fpn.simfp_%d.", level);
+                        auto load_conv = [&](int module, ggml_tensor * & weight, ggml_tensor * & bias,
+                                             ggml_tensor * & norm_w, ggml_tensor * & norm_b) {
+                            weight = get_tensor(string_format("%s%d.weight", prefix.c_str(), module));
+                            bias = get_tensor(string_format("%s%d.bias", prefix.c_str(), module), false);
+                            norm_w = get_tensor(string_format("%s%d.norm.weight", prefix.c_str(), module), false);
+                            norm_b = get_tensor(string_format("%s%d.norm.bias", prefix.c_str(), module), false);
+                        };
+                        auto & fpn = model.aux_fpn_levels[level - 1];
+                        if (level == 1) {
+                            load_conv(0, fpn.resize_w, fpn.resize_b, fpn.resize_norm_w, fpn.resize_norm_b);
+                            load_conv(3, fpn.resize2_w, fpn.resize2_b, fpn.resize2_norm_w, fpn.resize2_norm_b);
+                            load_conv(4, fpn.proj_w, fpn.proj_b, fpn.proj_norm_w, fpn.proj_norm_b);
+                            load_conv(5, fpn.out_w, fpn.out_b, fpn.out_norm_w, fpn.out_norm_b);
+                        } else if (level == 2) {
+                            load_conv(0, fpn.resize_w, fpn.resize_b, fpn.resize_norm_w, fpn.resize_norm_b);
+                            load_conv(1, fpn.proj_w, fpn.proj_b, fpn.proj_norm_w, fpn.proj_norm_b);
+                            load_conv(2, fpn.out_w, fpn.out_b, fpn.out_norm_w, fpn.out_norm_b);
+                        } else if (level == 3) {
+                            load_conv(0, fpn.proj_w, fpn.proj_b, fpn.proj_norm_w, fpn.proj_norm_b);
+                            load_conv(1, fpn.out_w, fpn.out_b, fpn.out_norm_w, fpn.out_norm_b);
+                        } else {
+                            load_conv(1, fpn.proj_w, fpn.proj_b, fpn.proj_norm_w, fpn.proj_norm_b);
+                            load_conv(2, fpn.out_w, fpn.out_b, fpn.out_norm_w, fpn.out_norm_b);
+                        }
+                    }
+                    model.mm_0_w = get_tensor("fo1.proj.0.weight");
+                    model.mm_0_b = get_tensor("fo1.proj.0.bias", false);
+                    model.mm_1_w = get_tensor("fo1.proj.2.weight");
+                    model.mm_1_b = get_tensor("fo1.proj.2.bias", false);
                 } break;
             case PROJECTOR_TYPE_STEP3VL:
                 {
@@ -4022,6 +4118,10 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 int y_patch = img->ny() / (params.patch_size * 2);
                 n_patches = x_patch * y_patch;
             } break;
+        case PROJECTOR_TYPE_VLM_FO1_AUX:
+            {
+                n_patches = params.n_region_tokens;
+            } break;
         case PROJECTOR_TYPE_STEP3VL:
             {
                 int x_patch = img->nx() / (params.patch_size * params.n_merge);
@@ -4262,9 +4362,20 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
         case PROJECTOR_TYPE_POCKETTTS_GEN: return list_pockettts_state_slots(hparams, model);
         default:                           return {};
     }
+
 }
 
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+    if (ctx->model.proj_type == PROJECTOR_TYPE_VLM_FO1_AUX) {
+        if (params->bbox != nullptr) {
+            const size_t expected = (size_t) ctx->model.hparams.n_region_tokens * 4;
+            if (params->bbox->size() != expected) {
+                LOG_ERR("%s: VLM-FO1 auxiliary bbox input has %zu values; expected %zu\n",
+                    __func__, params->bbox->size(), expected);
+                return false;
+            }
+        }
+    }
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
@@ -4287,6 +4398,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
+    if (gf == nullptr) {
+        LOG_ERR("%s: failed to build the projector graph\n", __func__);
+        return false;
+    }
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
 
     // set inputs
@@ -4413,7 +4528,13 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 }
             }
         }
-        set_input_f32("inp_raw", inp_raw);
+        if (ggml_graph_get_tensor(gf, "inp_raw") != nullptr) {
+            set_input_f32("inp_raw", inp_raw);
+        }
+
+        if (params->input_feature_map != nullptr) {
+            set_input_f32("qwen2vl_feature_map", *params->input_feature_map);
+        }
 
     } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV) {
         // audio input. GEN_WAV is not here: it takes codes or feats, set in the switch below
@@ -4430,6 +4551,40 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     // set input per projector
     switch (ctx->model.proj_type) {
+        case PROJECTOR_TYPE_VLM_FO1_AUX:
+            if (ggml_graph_get_tensor(gf, "bbox") != nullptr) {
+                if (params->bbox) {
+                    const ggml_tensor * bbox = get_inp_tensor("bbox");
+                    if (params->bbox->size() != (size_t) ggml_nelements(bbox)) {
+                        LOG_ERR("%s: bbox has %zu values, expected %zu\n", __func__,
+                            params->bbox->size(), (size_t) ggml_nelements(bbox));
+                        return false;
+                    }
+                    set_input_f32("bbox", *params->bbox);
+                } else {
+                    const ggml_tensor * bbox = get_inp_tensor("bbox");
+                    const int n = bbox->ne[1];
+                    std::vector<float> full_image((size_t) n * 4);
+                    for (int i = 0; i < n; ++i) {
+                        full_image[4*i + 0] = 0.0f;
+                        full_image[4*i + 1] = 0.0f;
+                        full_image[4*i + 2] = (float) image_size_width;
+                        full_image[4*i + 3] = (float) image_size_height;
+                    }
+                    set_input_f32("bbox", full_image);
+                }
+            }
+            if (ggml_graph_get_tensor(gf, "bbox_pos") != nullptr) {
+                const ggml_tensor * bbox_pos = get_inp_tensor("bbox_pos");
+                const size_t expected = (size_t) ggml_nelements(bbox_pos);
+                if (params->bbox_pos == nullptr || params->bbox_pos->size() != expected) {
+                    LOG_ERR("%s: bbox_pos has %zu values, expected %zu\n", __func__,
+                        params->bbox_pos ? params->bbox_pos->size() : 0, expected);
+                    return false;
+                }
+                set_input_f32("bbox_pos", *params->bbox_pos);
+            }
+            break;
         case PROJECTOR_TYPE_MUSE_GLIMMER:
             {
                 const int grid_w = pos_w;            // image_size_width  / patch_size
@@ -5561,6 +5716,16 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
     }
 
+    if (params->out_feature_map != nullptr) {
+        ggml_tensor * feature_map = ggml_graph_get_tensor(gf, "qwen2vl_feature_map");
+        if (feature_map == nullptr) {
+            LOG_ERR("%s: requested feature map is unavailable for this projector\n", __func__);
+            return false;
+        }
+        params->out_feature_map->resize(ggml_nelements(feature_map));
+        ggml_backend_tensor_get(feature_map, params->out_feature_map->data(), 0, ggml_nbytes(feature_map));
+    }
+
     //
     // for audio gen models
     //
@@ -5699,6 +5864,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_merger_fc2_b->ne[0];
         case PROJECTOR_TYPE_MUSE_GLIMMER:
             return ctx->model.mm_2_w->ne[1];
+        case PROJECTOR_TYPE_VLM_FO1_AUX:
+            return ctx->model.mm_1_w->ne[1];
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_EXAONE4_5:

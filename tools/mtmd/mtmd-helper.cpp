@@ -107,6 +107,16 @@ private:
     bool enabled_;
 };
 
+static llama_token mtmd_find_fo1_region0(const llama_vocab * vocab) {
+    for (llama_token token = 0; token < llama_vocab_n_tokens(vocab); ++token) {
+        const char * text = llama_vocab_get_text(vocab, token);
+        if (text != nullptr && std::string(text) == "<region0>") {
+            return token;
+        }
+    }
+    return -1;
+}
+
 // Helper function for decoding an image whose embeddings have already been calculated
 int32_t mtmd_helper_decode_image_chunk(
         mtmd_context * ctx,
@@ -186,7 +196,18 @@ int32_t mtmd_helper_decode_image_chunk(
         i_batch++;
     }
 
-    n_past += mtmd_input_chunk_get_n_pos(chunk);
+    if (mtmd_is_fo1(ctx) && mtmd_decode_use_mrope(ctx)) {
+        const auto * image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
+        const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        llama_pos max_pos = n_past;
+        for (size_t i = 0; i < n_tokens; ++i) {
+            const mtmd_decoder_pos pos = mtmd_image_tokens_get_decoder_pos(image_tokens, n_past, i);
+            max_pos = std::max(max_pos, (llama_pos) std::max(std::max(pos.t, pos.x), std::max(pos.y, pos.z)));
+        }
+        n_past = max_pos + 1;
+    } else {
+        n_past += mtmd_input_chunk_get_n_pos(chunk);
+    }
     *new_n_past = n_past;
 
     return 0;
@@ -202,17 +223,40 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
         llama_pos * new_n_past) {
     GGML_ASSERT(n_batch > 0);
     int32_t ret;
+    const int n_mmproj_embd = llama_model_n_embd_inp(llama_get_model(lctx));
     llama_batch text_batch = llama_batch_init(n_batch, 0, 1);
     auto chunk_type = mtmd_input_chunk_get_type(chunk);
 
     if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+        const llama_token region0 = mtmd_is_fo1(ctx) ? mtmd_find_fo1_region0(llama_model_get_vocab(llama_get_model(lctx))) : -1;
         size_t n_tokens;
         const auto tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
-        // LOG_INF("decoding text chunk, n_tokens = %zu\n", n_tokens);
+        auto decode_region = [&](int region) -> int32_t {
+            const float * region_embd = mtmd_get_fo1_output_embd(ctx);
+            const int n_regions = mtmd_get_fo1_n_tokens(ctx);
+            if (!region_embd || region < 0 || region >= n_regions) {
+                LOG_ERR("FO1 region embedding is unavailable for region %d\n", region);
+                return 1;
+            }
+            decode_embd_batch batch(const_cast<float *>(region_embd) +
+                (size_t) region * n_mmproj_embd, 1, 1, n_mmproj_embd);
+            batch.set_position_normal(n_past, seq_id);
+            const int32_t result = llama_decode(lctx, batch.batch);
+            if (result != 0) {
+                return result;
+            }
+            n_past++;
+            (*new_n_past)++;
+            return 0;
+        };
         size_t i = 0;
         while (i < n_tokens) { // split into batches
             text_batch.n_tokens = 0; // clear the batch
             for (; i < n_tokens && text_batch.n_tokens < n_batch; i++) {
+                const int region = region0 >= 0 ? (int) tokens[i] - region0 : -1;
+                if (mtmd_is_fo1(ctx) && region >= 0 && region < mtmd_get_fo1_n_tokens(ctx)) {
+                    break;
+                }
                 int32_t j = text_batch.n_tokens;
                 text_batch.token   [j]    = tokens[i];
                 text_batch.pos     [j]    = n_past++;
@@ -223,17 +267,42 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
                 text_batch.n_tokens++;
             }
             bool is_last_token = (i == n_tokens);
-            if (logits_last && is_last_token) {
+            if (text_batch.n_tokens > 0 && logits_last && is_last_token) {
                 text_batch.logits[text_batch.n_tokens - 1] = true;
             }
-            ret = llama_decode(lctx, text_batch);
-            if (ret != 0) {
-                LOG_ERR("failed to decode text\n");
-                llama_batch_free(text_batch);
-                return ret;
+            if (text_batch.n_tokens > 0) {
+                ret = llama_decode(lctx, text_batch);
+                if (ret != 0) {
+                    LOG_ERR("failed to decode text\n");
+                    llama_batch_free(text_batch);
+                    return ret;
+                }
+                *new_n_past += text_batch.n_tokens;
+                n_past += text_batch.n_tokens;
             }
-            *new_n_past += text_batch.n_tokens;
+
+            if (i < n_tokens) {
+                const int region = region0 >= 0 ? (int) tokens[i] - region0 : -1;
+                text_batch.n_tokens = 1;
+                text_batch.token[0] = tokens[i++];
+                text_batch.pos[0] = n_past++;
+                text_batch.n_seq_id[0] = 1;
+                text_batch.seq_id[0][0] = seq_id;
+                text_batch.logits[0] = false;
+                ret = llama_decode(lctx, text_batch);
+                if (ret != 0) {
+                    llama_batch_free(text_batch);
+                    return ret;
+                }
+                (*new_n_past)++;
+                ret = decode_region(region);
+                if (ret != 0) {
+                    llama_batch_free(text_batch);
+                    return ret;
+                }
+            }
         }
+        *new_n_past = n_past;
 
     } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE || chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
@@ -289,6 +358,7 @@ int32_t mtmd_helper_eval_chunks(mtmd_context * ctx,
             return res;
         }
         *new_n_past = n_past;
+        fprintf(stderr, "mtmd image advanced to %d (fo1=%d)\n", (int) n_past, mtmd_is_fo1(ctx) ? 1 : 0);
     }
 
     return 0;

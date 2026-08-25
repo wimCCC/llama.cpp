@@ -176,6 +176,11 @@ ggml_cgraph * clip_graph_qwen2vl::build() {
         inpL = build_norm(inpL, model.post_ln_w, model.post_ln_b, norm_t, eps, n_layer);
     }
 
+    // Stable graph name used by the VLM-FO1 two-tower integration.  Keep the
+    // unmerged 1280-channel map; the following reshape performs Qwen's normal
+    // 2x2 token merger and must not be used as the region-feature source.
+    ggml_set_name(inpL, "qwen2vl_feature_map");
+
     // multimodal projection
     ggml_tensor * embeddings = inpL;
     embeddings = ggml_reshape_3d(ctx0, embeddings, n_embd * 4, n_pos / 4, batch_size);

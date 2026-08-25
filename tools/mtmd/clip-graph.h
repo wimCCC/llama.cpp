@@ -51,6 +51,7 @@ struct clip_graph {
     ggml_context_ptr ctx0_ptr;
     ggml_context * ctx0;
     ggml_cgraph * gf;
+    const clip_encode_params * encode_params = nullptr;
 
     clip_graph(clip_ctx * ctx, const clip_image_f32 & img);
 

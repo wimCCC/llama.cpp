@@ -114,6 +114,10 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // Optional normalized [x0, y0, x1, y1] boxes for VLM-FO1 regions.
+    const float * fo1_bbox;
+    size_t fo1_bbox_count;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -304,6 +308,10 @@ MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
 // the reading size (in bytes) is equal to:
 // llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
 MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
+
+MTMD_API const float * mtmd_get_fo1_output_embd(const mtmd_context * ctx);
+MTMD_API int32_t mtmd_get_fo1_n_tokens(const mtmd_context * ctx);
+MTMD_API bool mtmd_is_fo1(const mtmd_context * ctx);
 
 
 // batch encoding API

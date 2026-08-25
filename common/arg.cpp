@@ -35,6 +35,7 @@
 #include <regex>
 #include <set>
 #include <string>
+#include <sstream>
 #include <thread> // for hardware_concurrency
 #include <vector>
 
@@ -2567,6 +2568,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.mtmd_batch_max_tokens = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTMD_BATCH_MAX_TOKENS"));
+    add_opt(common_arg(
+        {"--fo1-bbox"}, "FILE",
+        "read 100 normalized FO1 xyxy boxes from a whitespace- or comma-separated file",
+        [](common_params & params, const std::string & value) {
+            std::ifstream file(value);
+            if (!file) {
+                throw std::runtime_error("error: failed to open FO1 bbox file: " + value);
+            }
+            std::string contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            std::replace(contents.begin(), contents.end(), ',', ' ');
+            std::istringstream stream(contents);
+            params.fo1_bbox.clear();
+            float coordinate;
+            while (stream >> coordinate) {
+                params.fo1_bbox.push_back(coordinate);
+            }
+            if (params.fo1_bbox.size() != 400) {
+                throw std::runtime_error("error: --fo1-bbox requires exactly 400 values");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_MTMD}));
     if (params.is_gen_docs || llama_supports_rpc()) {
         add_opt(common_arg(
             {"--rpc"}, "SERVERS",

@@ -95,6 +95,16 @@ struct clip_encode_params {
     int n_threads = 1;
     const clip_image_f32_batch * imgs = nullptr;
     std::vector<float> * out_embd = nullptr;
+    // Optional Qwen vision feature map, before multimodal projection.
+    std::vector<float> * out_feature_map = nullptr;
+    // Optional Qwen feature map supplied to a composite FO1 graph.
+    const std::vector<float> * input_feature_map = nullptr;
+    int input_feature_map_width = 0;
+    int input_feature_map_height = 0;
+    // Optional VLM-FO1 region boxes in image pixel coordinates (xyxy).
+    const std::vector<float> * bbox = nullptr;
+    // Optional VLM-FO1 sine/cosine positional encoding, one 5888-vector per box.
+    const std::vector<float> * bbox_pos = nullptr;
 
     // for audio gen, imgs has exactly one entry: hidden state from backbone (GEN_CODE) or unused (GEN_WAV)
     clip_gen_process_type gen_process = CLIP_GEN_PROCESS_GEN_UNKNOWN;

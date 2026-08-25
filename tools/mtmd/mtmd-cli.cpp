@@ -160,6 +160,10 @@ struct mtmd_cli_context {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        if (!params.fo1_bbox.empty()) {
+            mparams.fo1_bbox = params.fo1_bbox.data();
+            mparams.fo1_bbox_count = params.fo1_bbox.size();
+        }
         if (std::getenv("MTMD_DEBUG_GRAPH") != nullptr) {
             mparams.cb_eval_user_data = &cb_data;
             mparams.cb_eval = common_debug_cb_eval;
@@ -196,6 +200,9 @@ struct mtmd_cli_context {
 };
 
 static int generate_response(mtmd_cli_context & ctx, int n_predict) {
+    const int64_t generation_start_ms = ggml_time_ms();
+    int64_t first_token_ms = -1;
+    int64_t generation_end_ms = generation_start_ms;
     llama_tokens generated_tokens;
     for (int i = 0; i < n_predict; i++) {
         if (i > n_predict || !g_is_generating || g_is_interrupted) {
@@ -204,6 +211,9 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
         }
 
         llama_token token_id = common_sampler_sample(ctx.smpl, ctx.lctx, -1);
+        if (first_token_ms < 0) {
+            first_token_ms = ggml_time_ms();
+        }
         generated_tokens.push_back(token_id);
         common_sampler_accept(ctx.smpl, token_id, true);
 
@@ -227,6 +237,7 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
             LOG_ERR("failed to decode token\n");
             return 1;
         }
+        generation_end_ms = ggml_time_ms();
     }
 
     std::string generated_text = common_detokenize(ctx.lctx, generated_tokens);
@@ -234,6 +245,15 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
     msg.role    = "assistant";
     msg.content = generated_text;
     ctx.chat_history.push_back(std::move(msg));
+
+    if (first_token_ms >= 0) {
+        const double ttft_ms = (double) (first_token_ms - generation_start_ms);
+        const int n_generated = (int) generated_tokens.size();
+        const double decode_ms = (double) (generation_end_ms - first_token_ms);
+        const double tpot_ms = n_generated > 1 ? decode_ms / (n_generated - 1) : 0.0;
+        LOG_INF("generation: tokens=%d, TTFT=%.2f ms, TPOT=%.2f ms/token, generation=%.2f ms\n",
+            n_generated, ttft_ms, tpot_ms, (double) (generation_end_ms - generation_start_ms));
+    }
 
     return 0;
 }
@@ -466,6 +486,7 @@ int main(int argc, char ** argv) {
         if (!g_is_interrupted && generate_response(ctx, n_predict)) {
             return 1;
         }
+        llama_perf_context_print(ctx.lctx);
 
     } else {
         LOG("\n Running in chat mode, available commands:");

@@ -58,6 +58,7 @@ struct clip_hparams {
     int32_t n_embd_head = 0;
     int32_t n_layer = 0;
     int32_t n_merge = 1; // number of patch merges **per-side**
+    int32_t n_region_tokens = 100;
 
     // for preprocessor
     int32_t image_longest_edge = 0;
@@ -342,6 +343,63 @@ struct clip_layer {
     }
 };
 
+struct clip_aux_davit_block {
+    ggml_tensor * channel_norm_w = nullptr;
+    ggml_tensor * channel_norm_b = nullptr;
+    ggml_tensor * channel_qkv_w = nullptr;
+    ggml_tensor * channel_qkv_b = nullptr;
+    ggml_tensor * channel_o_w = nullptr;
+    ggml_tensor * channel_o_b = nullptr;
+    ggml_tensor * channel_dw1_w = nullptr;
+    ggml_tensor * channel_dw1_b = nullptr;
+    ggml_tensor * channel_dw2_w = nullptr;
+    ggml_tensor * channel_dw2_b = nullptr;
+    ggml_tensor * channel_ffn_norm_w = nullptr;
+    ggml_tensor * channel_ffn_norm_b = nullptr;
+    ggml_tensor * channel_ffn_up_w = nullptr;
+    ggml_tensor * channel_ffn_up_b = nullptr;
+    ggml_tensor * channel_ffn_down_w = nullptr;
+    ggml_tensor * channel_ffn_down_b = nullptr;
+    ggml_tensor * spatial_dw1_w = nullptr;
+    ggml_tensor * spatial_dw1_b = nullptr;
+    ggml_tensor * spatial_dw2_w = nullptr;
+    ggml_tensor * spatial_dw2_b = nullptr;
+    ggml_tensor * spatial_norm_w = nullptr;
+    ggml_tensor * spatial_norm_b = nullptr;
+    ggml_tensor * spatial_qkv_w = nullptr;
+    ggml_tensor * spatial_qkv_b = nullptr;
+    ggml_tensor * spatial_o_w = nullptr;
+    ggml_tensor * spatial_o_b = nullptr;
+    ggml_tensor * spatial_ffn_norm_w = nullptr;
+    ggml_tensor * spatial_ffn_norm_b = nullptr;
+    ggml_tensor * spatial_ffn_up_w = nullptr;
+    ggml_tensor * spatial_ffn_up_b = nullptr;
+    ggml_tensor * spatial_ffn_down_w = nullptr;
+    ggml_tensor * spatial_ffn_down_b = nullptr;
+};
+
+// One SimpleFPN level.  The optional resize projection is represented by
+// resize_w/resize_b; proj is the level projection and out is its 3x3 output
+// convolution.  Norm tensors belong to the corresponding convolution.
+struct clip_aux_fpn_level {
+    ggml_tensor * resize_w = nullptr;
+    ggml_tensor * resize_b = nullptr;
+    ggml_tensor * resize2_w = nullptr;
+    ggml_tensor * resize2_b = nullptr;
+    ggml_tensor * resize2_norm_w = nullptr;
+    ggml_tensor * resize2_norm_b = nullptr;
+    ggml_tensor * resize_norm_w = nullptr;
+    ggml_tensor * resize_norm_b = nullptr;
+    ggml_tensor * proj_w = nullptr;
+    ggml_tensor * proj_b = nullptr;
+    ggml_tensor * proj_norm_w = nullptr;
+    ggml_tensor * proj_norm_b = nullptr;
+    ggml_tensor * out_w = nullptr;
+    ggml_tensor * out_b = nullptr;
+    ggml_tensor * out_norm_w = nullptr;
+    ggml_tensor * out_norm_b = nullptr;
+};
+
 // Expanded MobileNetV5 block structure for Gemma3n vision encoder
 struct mobilenetv5_block {
     // Stage 0 (Edge Residual)
@@ -550,6 +608,12 @@ struct clip_model {
     ggml_tensor * patch_embeddings_0 = nullptr;
     ggml_tensor * patch_embeddings_1 = nullptr;  // second Conv2D kernel when we decouple Conv3D along temporal dimension (Qwen2VL)
     ggml_tensor * patch_bias = nullptr;
+    std::vector<ggml_tensor *> aux_conv_w;
+    std::vector<ggml_tensor *> aux_conv_b;
+    std::vector<ggml_tensor *> aux_conv_norm_w;
+    std::vector<ggml_tensor *> aux_conv_norm_b;
+    std::vector<clip_aux_davit_block> aux_davit_blocks;
+    std::vector<clip_aux_fpn_level> aux_fpn_levels;
     ggml_tensor * position_embeddings = nullptr;
     ggml_tensor * norm_embd_w = nullptr;
     ggml_tensor * norm_embd_b = nullptr;

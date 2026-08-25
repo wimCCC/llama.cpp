@@ -17,6 +17,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +25,7 @@
 #include <climits>
 #include <type_traits>
 #include <vector>
+#include <string>
 
 // remember to bump this if the serialization format changes
 #define MTMD_SERIALIZATION_VERSION 1
@@ -465,14 +467,19 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* fo1_bbox */ nullptr,
+        /* fo1_bbox_count */ 0,
     };
     return params;
 }
 
 struct mtmd_context {
     struct clip_ctx * ctx_v; // vision
+    struct clip_ctx * ctx_aux = nullptr; // VLM-FO1 auxiliary region tower
     struct clip_ctx * ctx_a; // audio
     std::vector<float> out_embd; // image embedding vector
+    std::vector<float> fo1_region_embd;
+    std::vector<float> fo1_bbox;
 
     // generation context
     struct clip_ctx * ctx_gen_a; // audio
@@ -531,6 +538,21 @@ struct mtmd_context {
         vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
         batch_max_tokens(ctx_params.batch_max_tokens)
     {
+        if (ctx_params.fo1_bbox != nullptr) {
+            if (ctx_params.fo1_bbox_count != 400) {
+                throw std::runtime_error("fo1_bbox must contain 100 normalized xyxy boxes");
+            }
+            fo1_bbox.assign(ctx_params.fo1_bbox,
+                ctx_params.fo1_bbox + ctx_params.fo1_bbox_count);
+            for (size_t i = 0; i < fo1_bbox.size(); i += 4) {
+                if (fo1_bbox[i + 0] < 0.0f || fo1_bbox[i + 1] < 0.0f ||
+                    fo1_bbox[i + 2] > 1.0f || fo1_bbox[i + 3] > 1.0f ||
+                    fo1_bbox[i + 0] > fo1_bbox[i + 2] ||
+                    fo1_bbox[i + 1] > fo1_bbox[i + 3]) {
+                    throw std::runtime_error("fo1_bbox coordinates must be normalized xyxy values");
+                }
+            }
+        }
         if (ctx_params.image_marker != nullptr) {
             throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
         }
@@ -575,6 +597,18 @@ struct mtmd_context {
         ctx_v = res.ctx_v;
         ctx_a = res.ctx_a;
         ctx_gen_a = res.ctx_gen_a;
+        if (ctx_v && clip_get_projector_type(ctx_v) == PROJECTOR_TYPE_QWEN25VL) {
+            const std::string path(mmproj_fname);
+            const size_t slash = path.find_last_of("/\\");
+            const std::string dir = slash == std::string::npos ? "" : path.substr(0, slash + 1);
+            const std::string aux_path = dir + "vlm-fo1-aux-f16.gguf";
+            FILE * aux_file = std::fopen(aux_path.c_str(), "rb");
+            if (aux_file) {
+                std::fclose(aux_file);
+                auto aux_res = clip_init(aux_path.c_str(), ctx_clip_params);
+                ctx_aux = aux_res.ctx_v;
+            }
+        }
         if (!ctx_v && !ctx_a) {
             throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
         }
@@ -687,6 +721,7 @@ struct mtmd_context {
             case PROJECTOR_TYPE_QWEN25VL:
             case PROJECTOR_TYPE_QWEN3VL:
             case PROJECTOR_TYPE_MIMOVL:
+            case PROJECTOR_TYPE_VLM_FO1_AUX:
                 {
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
                     img_beg = "<|vision_start|>";
@@ -1024,6 +1059,7 @@ struct mtmd_context {
     ~mtmd_context() {
         clip_free(ctx_a);
         clip_free(ctx_v);
+        clip_free(ctx_aux);
         clip_free(ctx_gen_a);
     }
 
@@ -1506,6 +1542,13 @@ struct mtmd_tokenizer {
                 add_text(ctx->img_end, true); // add image end token
             }
 
+            if (ctx->ctx_aux) {
+                const int n_regions = clip_get_hparams(ctx->ctx_aux)->n_region_tokens;
+                for (int i = 0; i < n_regions; ++i) {
+                    add_text(string_format("<region%d>", i), true);
+                }
+            }
+
             // advance image-chunk counter so the next image gets the next XD-RoPE dim-3 slot
             n_images_added++;
 
@@ -1721,11 +1764,71 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
         return 1;
     }
 
-    bool ok = clip_image_batch_encode(
-        ctx_clip,
-        ctx->n_threads,
-        &image_tokens->batch_f32,
-        out_embd);
+    std::vector<float> feature_map;
+    clip_encode_params main_params;
+    main_params.imgs = &image_tokens->batch_f32;
+    main_params.n_threads = ctx->n_threads;
+    main_params.out_embd = &out_embd;
+    main_params.out_feature_map = ctx->ctx_aux ? &feature_map : nullptr;
+    bool ok = clip_encode(ctx_clip, &main_params);
+
+    if (ok && ctx->ctx_aux) {
+        const int n_regions = clip_get_hparams(ctx->ctx_aux)->n_region_tokens;
+        std::vector<float> boxes((size_t) n_regions * 4);
+        const float width = (float) image_tokens->batch_f32.entries[0].nx();
+        const float height = (float) image_tokens->batch_f32.entries[0].ny();
+        if (!ctx->fo1_bbox.empty() && ctx->fo1_bbox.size() != boxes.size()) {
+            LOG_ERR("%s: FO1 bbox count is %zu, expected %zu\n", __func__,
+                ctx->fo1_bbox.size(), boxes.size());
+            return 1;
+        }
+        if (ctx->fo1_bbox.size() == boxes.size()) {
+            for (int i = 0; i < n_regions; ++i) {
+                boxes[4*i + 0] = ctx->fo1_bbox[4*i + 0] * width;
+                boxes[4*i + 1] = ctx->fo1_bbox[4*i + 1] * height;
+                boxes[4*i + 2] = ctx->fo1_bbox[4*i + 2] * width;
+                boxes[4*i + 3] = ctx->fo1_bbox[4*i + 3] * height;
+            }
+        } else {
+            for (int i = 0; i < n_regions; ++i) {
+                boxes[4*i + 2] = width;
+                boxes[4*i + 3] = height;
+            }
+        }
+        clip_encode_params aux_params;
+        aux_params.imgs = &image_tokens->batch_f32;
+        aux_params.n_threads = ctx->n_threads;
+        aux_params.input_feature_map = &feature_map;
+        aux_params.input_feature_map_width = image_tokens->batch_f32.entries[0].nx() / 14;
+        aux_params.input_feature_map_height = image_tokens->batch_f32.entries[0].ny() / 14;
+        aux_params.bbox = &boxes;
+        std::vector<float> bbox_pos((size_t) n_regions * 5888);
+        constexpr int n_freq = 736;
+        constexpr float temperature = 10000.0f;
+        for (int i = 0; i < n_regions; ++i) {
+            const float coords[4] = {
+                boxes[4*i + 0] / width,
+                boxes[4*i + 1] / height,
+                boxes[4*i + 2] / width,
+                boxes[4*i + 3] / height,
+            };
+            for (int c = 0; c < 4; ++c) {
+                for (int f = 0; f < n_freq; ++f) {
+                    const float scale = std::pow(temperature, 2.0f * f / n_freq);
+                    const float angle = coords[c] / scale;
+                    bbox_pos[(size_t) i * 5888 + c * 1472 + 2*f + 0] = std::sin(angle);
+                    bbox_pos[(size_t) i * 5888 + c * 1472 + 2*f + 1] = std::cos(angle);
+                }
+            }
+        }
+        aux_params.bbox_pos = &bbox_pos;
+        ctx->fo1_region_embd.resize((size_t) ctx->n_embd_out() * n_regions);
+        aux_params.out_embd = &ctx->fo1_region_embd;
+        ok = clip_encode(ctx->ctx_aux, &aux_params);
+        if (!ok) {
+            LOG_ERR("%s: FO1 auxiliary feature-map encoding failed\n", __func__);
+        }
+    }
 
     return ok ? 0 : 1;
 }
@@ -1796,6 +1899,18 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
 
 float * mtmd_get_output_embd(mtmd_context * ctx) {
     return ctx->out_embd.data();
+}
+
+const float * mtmd_get_fo1_output_embd(const mtmd_context * ctx) {
+    return ctx->fo1_region_embd.empty() ? nullptr : ctx->fo1_region_embd.data();
+}
+
+int32_t mtmd_get_fo1_n_tokens(const mtmd_context * ctx) {
+    return ctx->ctx_aux ? clip_get_hparams(ctx->ctx_aux)->n_region_tokens : 0;
+}
+
+bool mtmd_is_fo1(const mtmd_context * ctx) {
+    return ctx->ctx_aux != nullptr;
 }
 
 //
