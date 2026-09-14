@@ -545,6 +545,7 @@ extern "C" {
         GGML_OP_POOL_1D,
         GGML_OP_POOL_2D,
         GGML_OP_POOL_2D_BACK,
+        GGML_OP_ROI_ALIGN,
         GGML_OP_UPSCALE,
         GGML_OP_PAD,
         GGML_OP_PAD_REFLECT_1D,
@@ -2242,6 +2243,19 @@ extern "C" {
             int                   s1,
             float                 p0,
             float                 p1);
+
+    // Samples one point at the center of each output bin using bilinear interpolation.
+    // a:     [channels, width, height, 1]
+    // boxes: [4, n_rois], with coordinates in the space selected by spatial_scale.
+    // result:[channels, pooled_width, pooled_height, n_rois]
+    GGML_API struct ggml_tensor * ggml_roi_align(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * boxes,
+            int                   pooled_width,
+            int                   pooled_height,
+            float                 spatial_scale_x,
+            float                 spatial_scale_y);
 
     enum ggml_scale_mode {
         GGML_SCALE_MODE_NEAREST  = 0,

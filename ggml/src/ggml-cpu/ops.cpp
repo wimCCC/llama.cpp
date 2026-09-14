@@ -7705,6 +7705,58 @@ void ggml_compute_forward_pool_2d(
     }
 }
 
+void ggml_compute_forward_roi_align(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src   = dst->src[0];
+    const ggml_tensor * boxes = dst->src[1];
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(boxes->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(boxes));
+    GGML_ASSERT(src->ne[3] == 1 && boxes->ne[0] == 4);
+
+    const float spatial_scale_x = ggml_get_op_params_f32(dst, 0);
+    const float spatial_scale_y = ggml_get_op_params_f32(dst, 1);
+    const int64_t channels      = src->ne[0];
+    const int64_t width         = src->ne[1];
+    const int64_t height        = src->ne[2];
+    const int64_t pooled_width  = dst->ne[1];
+    const int64_t pooled_height = dst->ne[2];
+    const int64_t total         = ggml_nelements(dst);
+
+    for (int64_t i = params->ith; i < total; i += params->nth) {
+        const int64_t c   = i % channels;
+        const int64_t bin = (i / channels) % (pooled_width * pooled_height);
+        const int64_t roi = i / (channels * pooled_width * pooled_height);
+        const int64_t bx  = bin % pooled_width;
+        const int64_t by  = bin / pooled_width;
+
+        const char * box = (const char *) boxes->data + roi * boxes->nb[1];
+        const float x0 = *(const float *) (box + 0 * boxes->nb[0]) * spatial_scale_x;
+        const float y0 = *(const float *) (box + 1 * boxes->nb[0]) * spatial_scale_y;
+        const float x1 = *(const float *) (box + 2 * boxes->nb[0]) * spatial_scale_x;
+        const float y1 = *(const float *) (box + 3 * boxes->nb[0]) * spatial_scale_y;
+        const float x = std::max(0.0f, std::min((float) (width  - 1),
+            x0 + (bx + 0.5f) * (x1 - x0) / pooled_width - 0.5f));
+        const float y = std::max(0.0f, std::min((float) (height - 1),
+            y0 + (by + 0.5f) * (y1 - y0) / pooled_height - 0.5f));
+        const int64_t xa = (int64_t) floorf(x);
+        const int64_t ya = (int64_t) floorf(y);
+        const int64_t xb = std::min(xa + 1, width  - 1);
+        const int64_t yb = std::min(ya + 1, height - 1);
+        const float wx = x - xa;
+        const float wy = y - ya;
+
+        auto at = [&](int64_t px, int64_t py) {
+            return *(const float *) ((const char *) src->data + c * src->nb[0] + px * src->nb[1] + py * src->nb[2]);
+        };
+        ((float *) dst->data)[i] = (1.0f - wy) * ((1.0f - wx) * at(xa, ya) + wx * at(xb, ya))
+                                + wy * ((1.0f - wx) * at(xa, yb) + wx * at(xb, yb));
+    }
+}
+
 // ggml_compute_forward_pool_2d_back
 
 void ggml_compute_forward_pool_2d_back(

@@ -1054,6 +1054,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "POOL_1D",
     "POOL_2D",
     "POOL_2D_BACK",
+    "ROI_ALIGN",
     "UPSCALE",
     "PAD",
     "PAD_REFLECT_1D",
@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1169,6 +1170,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "pool_1d(x)",
     "pool_2d(x)",
     "pool_2d_back(x)",
+    "roi_align(x, boxes)",
     "upscale(x)",
     "pad(x)",
     "pad_reflect_1d(x)",
@@ -1215,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5052,6 +5054,34 @@ struct ggml_tensor * ggml_pool_2d_back(
     result->op     = GGML_OP_POOL_2D_BACK;
     result->src[0] = a;
     result->src[1] = af;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_roi_align(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * boxes,
+        int                   pooled_width,
+        int                   pooled_height,
+        float                 spatial_scale_x,
+        float                 spatial_scale_y) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(boxes->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[3] == 1);
+    GGML_ASSERT(boxes->ne[0] == 4 && boxes->ne[1] > 0 && boxes->ne[2] == 1 && boxes->ne[3] == 1);
+    GGML_ASSERT(pooled_width > 0 && pooled_height > 0);
+    GGML_ASSERT(spatial_scale_x > 0.0f && spatial_scale_y > 0.0f);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, a->ne[0], pooled_width, pooled_height, boxes->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, spatial_scale_x);
+    ggml_set_op_params_f32(result, 1, spatial_scale_y);
+
+    result->op     = GGML_OP_ROI_ALIGN;
+    result->src[0] = a;
+    result->src[1] = boxes;
 
     return result;
 }

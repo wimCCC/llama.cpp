@@ -386,8 +386,6 @@ struct clip_aux_fpn_level {
     ggml_tensor * resize_b = nullptr;
     ggml_tensor * resize2_w = nullptr;
     ggml_tensor * resize2_b = nullptr;
-    ggml_tensor * resize2_norm_w = nullptr;
-    ggml_tensor * resize2_norm_b = nullptr;
     ggml_tensor * resize_norm_w = nullptr;
     ggml_tensor * resize_norm_b = nullptr;
     ggml_tensor * proj_w = nullptr;

@@ -479,7 +479,12 @@ struct mtmd_context {
     struct clip_ctx * ctx_a; // audio
     std::vector<float> out_embd; // image embedding vector
     std::vector<float> fo1_region_embd;
+    float * fo1_region_embd_pinned = nullptr;
+    float * fo1_interleaved_embd_pinned = nullptr;
+    std::vector<float> fo1_marker_embd;
+    llama_token fo1_region0 = LLAMA_TOKEN_NULL;
     std::vector<float> fo1_bbox;
+    std::vector<float> fo1_bbox_pos;
 
     // generation context
     struct clip_ctx * ctx_gen_a; // audio
@@ -640,6 +645,43 @@ struct mtmd_context {
                     "mismatch between text model (n_embd = %d) and gen-audio mmproj (n_embd = %d)\n"
                     "hint: you may be using wrong mmproj\n",
                     n_embd_text, n_embd_gen));
+            }
+        }
+        if (ctx_aux) {
+            const int n_regions = clip_get_hparams(ctx_aux)->n_region_tokens;
+            if (text_model) {
+                for (llama_token token = 0; token < llama_vocab_n_tokens(vocab); ++token) {
+                    const char * text = llama_vocab_get_text(vocab, token);
+                    if (text != nullptr && std::strcmp(text, "<region0>") == 0) {
+                        fo1_region0 = token;
+                        break;
+                    }
+                }
+                if (fo1_region0 != LLAMA_TOKEN_NULL) {
+                    fo1_marker_embd.resize((size_t) n_regions * n_embd_text);
+                    if (!llama_model_get_token_embeddings(text_model, fo1_region0, n_regions, fo1_marker_embd.data())) {
+                        throw std::runtime_error("failed to cache FO1 region marker embeddings");
+                    }
+                }
+            }
+            fo1_bbox_pos.resize((size_t) n_regions * 5888);
+            constexpr int n_freq = 736;
+            constexpr float temperature = 10000.0f;
+            for (int i = 0; i < n_regions; ++i) {
+                const float coords[4] = {
+                    fo1_bbox.empty() ? 0.0f : fo1_bbox[4*i + 0],
+                    fo1_bbox.empty() ? 0.0f : fo1_bbox[4*i + 1],
+                    fo1_bbox.empty() ? 1.0f : fo1_bbox[4*i + 2],
+                    fo1_bbox.empty() ? 1.0f : fo1_bbox[4*i + 3],
+                };
+                for (int c = 0; c < 4; ++c) {
+                    for (int f = 0; f < n_freq; ++f) {
+                        const float scale = std::pow(temperature, 2.0f * f / n_freq);
+                        const float angle = coords[c] / scale;
+                        fo1_bbox_pos[(size_t) i * 5888 + c * 1472 + 2*f + 0] = std::sin(angle);
+                        fo1_bbox_pos[(size_t) i * 5888 + c * 1472 + 2*f + 1] = std::cos(angle);
+                    }
+                }
             }
         }
         if (ctx_v) {
@@ -1097,11 +1139,46 @@ private:
     }
 };
 
+static void mtmd_fo1_compute_warmup(mtmd_context * ctx) {
+    GGML_ASSERT(ctx->ctx_v != nullptr && ctx->ctx_aux != nullptr);
+
+    const int image_size = clip_get_hparams(ctx->ctx_v)->warmup_image_size;
+    std::vector<unsigned char> pixels((size_t) image_size * image_size * 3, 0);
+    mtmd_bitmap bitmap(pixels.data(), image_size, image_size);
+    const mtmd_bitmap * bitmaps[] = { &bitmap };
+    mtmd_input_chunks chunks;
+    mtmd_input_text text {
+        /*.text          =*/ ctx->media_marker.c_str(),
+        /*.text_len      =*/ ctx->media_marker.size(),
+        /*.add_special   =*/ true,
+        /*.parse_special =*/ true,
+    };
+
+    if (mtmd_tokenize(ctx, &chunks, &text, bitmaps, 1) != 0) {
+        LOG_WRN("%s: failed to preprocess dummy image\n", __func__);
+        return;
+    }
+    for (const auto & chunk : chunks.entries) {
+        if (chunk.type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            if (mtmd_encode_chunk(ctx, &chunk) != 0) {
+                LOG_WRN("%s: failed to encode dummy image\n", __func__);
+            }
+            break;
+        }
+    }
+    ctx->out_embd.clear();
+    ctx->fo1_region_embd.clear();
+}
+
 mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct llama_model * text_model,
         const struct mtmd_context_params ctx_params) {
     try {
-        return new mtmd_context(mmproj_fname, text_model, ctx_params);
+        std::unique_ptr<mtmd_context> ctx(new mtmd_context(mmproj_fname, text_model, ctx_params));
+        if (ctx_params.warmup && ctx->ctx_aux && text_model) {
+            mtmd_fo1_compute_warmup(ctx.get());
+        }
+        return ctx.release();
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return nullptr;
@@ -1764,12 +1841,14 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
         return 1;
     }
 
-    std::vector<float> feature_map;
+    ggml_tensor * feature_map = nullptr;
+    ggml_backend_t feature_map_backend = nullptr;
     clip_encode_params main_params;
     main_params.imgs = &image_tokens->batch_f32;
     main_params.n_threads = ctx->n_threads;
     main_params.out_embd = &out_embd;
-    main_params.out_feature_map = ctx->ctx_aux ? &feature_map : nullptr;
+    main_params.out_feature_map_tensor = ctx->ctx_aux ? &feature_map : nullptr;
+    main_params.out_feature_map_backend = ctx->ctx_aux ? &feature_map_backend : nullptr;
     bool ok = clip_encode(ctx_clip, &main_params);
 
     if (ok && ctx->ctx_aux) {
@@ -1798,32 +1877,14 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
         clip_encode_params aux_params;
         aux_params.imgs = &image_tokens->batch_f32;
         aux_params.n_threads = ctx->n_threads;
-        aux_params.input_feature_map = &feature_map;
+        aux_params.input_feature_map_tensor = feature_map;
+        aux_params.input_feature_map_backend = feature_map_backend;
         aux_params.input_feature_map_width = image_tokens->batch_f32.entries[0].nx() / 14;
         aux_params.input_feature_map_height = image_tokens->batch_f32.entries[0].ny() / 14;
         aux_params.bbox = &boxes;
-        std::vector<float> bbox_pos((size_t) n_regions * 5888);
-        constexpr int n_freq = 736;
-        constexpr float temperature = 10000.0f;
-        for (int i = 0; i < n_regions; ++i) {
-            const float coords[4] = {
-                boxes[4*i + 0] / width,
-                boxes[4*i + 1] / height,
-                boxes[4*i + 2] / width,
-                boxes[4*i + 3] / height,
-            };
-            for (int c = 0; c < 4; ++c) {
-                for (int f = 0; f < n_freq; ++f) {
-                    const float scale = std::pow(temperature, 2.0f * f / n_freq);
-                    const float angle = coords[c] / scale;
-                    bbox_pos[(size_t) i * 5888 + c * 1472 + 2*f + 0] = std::sin(angle);
-                    bbox_pos[(size_t) i * 5888 + c * 1472 + 2*f + 1] = std::cos(angle);
-                }
-            }
-        }
-        aux_params.bbox_pos = &bbox_pos;
-        ctx->fo1_region_embd.resize((size_t) ctx->n_embd_out() * n_regions);
-        aux_params.out_embd = &ctx->fo1_region_embd;
+        aux_params.bbox_pos = &ctx->fo1_bbox_pos;
+        aux_params.out_embd_pinned = &ctx->fo1_region_embd_pinned;
+        aux_params.out_embd_pinned_scratch = &ctx->fo1_interleaved_embd_pinned;
         ok = clip_encode(ctx->ctx_aux, &aux_params);
         if (!ok) {
             LOG_ERR("%s: FO1 auxiliary feature-map encoding failed\n", __func__);
@@ -1902,7 +1963,19 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
 }
 
 const float * mtmd_get_fo1_output_embd(const mtmd_context * ctx) {
-    return ctx->fo1_region_embd.empty() ? nullptr : ctx->fo1_region_embd.data();
+    return ctx->fo1_region_embd_pinned;
+}
+
+float * mtmd_get_fo1_interleaved_embd(mtmd_context * ctx) {
+    return ctx->fo1_interleaved_embd_pinned;
+}
+
+const float * mtmd_get_fo1_marker_embd(const mtmd_context * ctx) {
+    return ctx->fo1_marker_embd.empty() ? nullptr : ctx->fo1_marker_embd.data();
+}
+
+llama_token mtmd_get_fo1_region0_token(const mtmd_context * ctx) {
+    return ctx->fo1_region0;
 }
 
 int32_t mtmd_get_fo1_n_tokens(const mtmd_context * ctx) {

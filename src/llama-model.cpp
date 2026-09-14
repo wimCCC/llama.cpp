@@ -2994,3 +2994,38 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
     return (uint32_t) nelements;
 }
+
+bool llama_model_get_token_embeddings(
+        const struct llama_model * model,
+        llama_token first_token,
+        int32_t n_tokens,
+        float * out) {
+    if (model == nullptr || model->tok_embd == nullptr || out == nullptr ||
+        first_token < 0 || n_tokens <= 0 ||
+        (uint64_t) first_token + n_tokens > model->vocab.n_tokens()) {
+        return false;
+    }
+
+    const ggml_tensor * tensor = model->tok_embd;
+    const int64_t n_embd = tensor->ne[0];
+    const size_t row_size = ggml_row_size(tensor->type, n_embd);
+    const size_t offset = (size_t) first_token * row_size;
+    const size_t size = (size_t) n_tokens * row_size;
+
+    if (tensor->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(tensor, out, offset, size);
+        return true;
+    }
+
+    std::vector<uint8_t> buf(size);
+    ggml_backend_tensor_get(tensor, buf.data(), offset, size);
+
+    const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+    if (traits->to_float == nullptr) {
+        return false;
+    }
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        traits->to_float(buf.data() + (size_t) i * row_size, out + (size_t) i * n_embd, n_embd);
+    }
+    return true;
+}

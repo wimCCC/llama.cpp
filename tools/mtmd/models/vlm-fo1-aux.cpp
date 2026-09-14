@@ -1,57 +1,7 @@
 #include "models.h"
 
 namespace {
-struct roi_align_params {
-    int width;
-    int height;
-    int pooled;
-    int n_rois;
-    float spatial_scale_x;
-    float spatial_scale_y;
-};
 
-static void roi_align_compute(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    const auto * p = (const roi_align_params *) userdata;
-    const ggml_tensor * src = dst->src[0];
-    const ggml_tensor * boxes = dst->src[1];
-    const float * x = (const float *) ggml_get_data(src);
-    const float * r = (const float *) ggml_get_data(boxes);
-    float * out = (float *) ggml_get_data(dst);
-    const int channels = src->ne[0];
-    const int bins = p->pooled * p->pooled;
-    const int total = channels * bins * p->n_rois;
-    for (int i = ith; i < total; i += nth) {
-        const int c = i % channels;
-        const int q = i / channels;
-        const int roi = q / bins;
-        const int bin = q % bins;
-        const int by = bin / p->pooled;
-        const int bx = bin % p->pooled;
-        const float * b = r + 4 * roi;
-        const float x0 = b[0] * p->spatial_scale_x;
-        const float y0 = b[1] * p->spatial_scale_y;
-        const float x1 = b[2] * p->spatial_scale_x;
-        const float y1 = b[3] * p->spatial_scale_y;
-        const float xx = x0 + (bx + 0.5f) * (x1 - x0) / p->pooled - 0.5f;
-        const float yy = y0 + (by + 0.5f) * (y1 - y0) / p->pooled - 0.5f;
-        const float fx = std::max(0.0f, std::min((float) (p->width - 1), xx));
-        const float fy = std::max(0.0f, std::min((float) (p->height - 1), yy));
-        const int xa = (int) floorf(fx), ya = (int) floorf(fy);
-        const int xb = std::min(xa + 1, p->width - 1), yb = std::min(ya + 1, p->height - 1);
-        const float wx = fx - xa, wy = fy - ya;
-        auto at = [&](int px, int py) { return x[c + channels * (px + p->width * py)]; };
-        out[i] = (1 - wy) * ((1 - wx) * at(xa, ya) + wx * at(xb, ya))
-               + wy * ((1 - wx) * at(xa, yb) + wx * at(xb, yb));
-    }
-}
-
-static ggml_tensor * roi_align(ggml_context * ctx, ggml_tensor * x, ggml_tensor * boxes,
-        int width, int height, int pooled, int n_rois, float spatial_scale_x, float spatial_scale_y) {
-    auto * p = new roi_align_params{ width, height, pooled, n_rois, spatial_scale_x, spatial_scale_y };
-    ggml_tensor * args[] = { x, boxes };
-    return ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], pooled, pooled, n_rois,
-        args, 2, roi_align_compute, GGML_N_TASKS_MAX, p);
-}
 static ggml_tensor * davit_dwconv(ggml_context * ctx, ggml_tensor * x,
         ggml_tensor * w, ggml_tensor * b, int width, int height, int channels) {
     ggml_tensor * image = ggml_reshape_4d(ctx, x, channels, width, height, 1);
@@ -132,10 +82,8 @@ static ggml_tensor * davit_window_reverse(ggml_context * ctx, ggml_tensor * x,
 ggml_cgraph * clip_graph_vlm_fo1_aux::build() {
     ggml_tensor * inp_raw = build_inp_raw();
     const int n_tokens = hparams.n_region_tokens;
-    const bool has_main_features = encode_params && encode_params->input_feature_map;
-    ggml_tensor * features = inp_raw;
-    ggml_tensor * qwen_features = nullptr;
-    std::vector<ggml_tensor *> aux_levels;
+    const bool has_main_features = encode_params &&
+        (encode_params->input_feature_map || encode_params->input_feature_map_tensor);
 
     GGML_ASSERT(model.aux_conv_w.size() == 4);
     const int kernels[] = { 7, 3, 3, 3 };
@@ -145,6 +93,9 @@ ggml_cgraph * clip_graph_vlm_fo1_aux::build() {
     const int heads[] = { 8, 16, 32, 64 };
     const int groups[] = { 8, 16, 32, 64 };
     const int depths[] = { 1, 1, 9, 1 };
+    ggml_tensor * features = inp_raw;
+    ggml_tensor * qwen_features = nullptr;
+    std::vector<ggml_tensor *> aux_levels;
     int block_offset = 0;
     auto apply_conv_norm = [&](ggml_tensor * x, ggml_tensor * w, ggml_tensor * b) {
         if (!w) {
@@ -160,18 +111,19 @@ ggml_cgraph * clip_graph_vlm_fo1_aux::build() {
         return ggml_cont(ctx0, ggml_reshape_4d(ctx0, tokens, width, height, channels, 1));
     };
     if (has_main_features) {
-        const size_t n_values = encode_params->input_feature_map->size();
-        GGML_ASSERT(n_values % 1280 == 0);
         const int width = encode_params->input_feature_map_width;
         const int height = encode_params->input_feature_map_height;
-        GGML_ASSERT(width > 0 && height > 0 && (size_t) width * height * 1280 == n_values);
-        features = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1280, width, height);
+        GGML_ASSERT(width > 0 && height > 0);
+        if (encode_params->input_feature_map) {
+            GGML_ASSERT((size_t) width * height * 1280 == encode_params->input_feature_map->size());
+        }
+        features = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1280, width * height, 1);
         ggml_set_name(features, "qwen2vl_feature_map");
         ggml_set_input(features);
+        features = ggml_reshape_3d(ctx0, features, 1280, width, height);
         qwen_features = ggml_cont(ctx0, ggml_permute(ctx0, features, 2, 0, 1, 3));
         features = inp_raw;
     }
-
     for (int i = 0; i < 4; ++i) {
         if (i > 0) {
             features = apply_conv_norm(features, model.aux_conv_norm_w[i], model.aux_conv_norm_b[i]);
@@ -257,8 +209,6 @@ ggml_cgraph * clip_graph_vlm_fo1_aux::build() {
     }
     ggml_tensor * region;
     if (!has_main_features) {
-        // The auxiliary GGUF can still be used for graph validation and
-        // standalone experiments. Full HFRE requires the Qwen feature map.
         ggml_tensor * mean = ggml_sum(ctx0, features);
         region = ggml_repeat(ctx0, mean,
             ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 5888, n_tokens));
@@ -281,7 +231,7 @@ ggml_cgraph * clip_graph_vlm_fo1_aux::build() {
         ggml_tensor * f1 = conv(qwen_features, l1.resize_w, l1.resize_b, 2);
         f1 = norm(f1, l1.resize_norm_w, l1.resize_norm_b);
         f1 = conv(f1, l1.resize2_w, l1.resize2_b, 2);
-        f1 = norm(f1, l1.resize2_norm_w, l1.resize2_norm_b);
+        f1 = norm(f1, l1.resize_norm_w, l1.resize_norm_b);
         f1 = norm(conv(f1, l1.proj_w, l1.proj_b, 1), l1.proj_norm_w, l1.proj_norm_b);
         fpn.push_back(norm(conv(f1, l1.out_w, l1.out_b, 1), l1.out_norm_w, l1.out_norm_b));
         ggml_tensor * f2 = conv(qwen_features, l2.resize_w, l2.resize_b, 2);
@@ -303,27 +253,21 @@ ggml_cgraph * clip_graph_vlm_fo1_aux::build() {
         ggml_tensor * bbox_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 5888, n_tokens);
         ggml_set_name(bbox_pos, "bbox_pos");
         ggml_set_input(bbox_pos);
-        ggml_tensor * pooled = roi_align(ctx0, semantic_map, boxes, tw, th, 14, n_tokens,
+        ggml_tensor * semantic = ggml_roi_align(ctx0, semantic_map, boxes, 14, 14,
             (float) tw / img.nx(), (float) th / img.ny());
-        pooled = ggml_reshape_3d(ctx0, pooled, 2048, 14 * 14, n_tokens);
-        pooled = ggml_cont(ctx0, ggml_permute(ctx0, pooled, 1, 0, 2, 3));
-        ggml_tensor * semantic = ggml_cont_2d(ctx0, ggml_mean(ctx0, pooled), 2048, n_tokens);
 
         const int aw = aux_levels[0]->ne[0];
         const int ah = aux_levels[0]->ne[1];
         ggml_tensor * perception_map = aux_levels[0];
         for (size_t i = 1; i < aux_levels.size(); ++i) {
-            ggml_tensor * level = aux_levels[i];
-            level = ggml_interpolate(ctx0, level, aw, ah, level->ne[2], level->ne[3],
+            ggml_tensor * level = ggml_interpolate(ctx0, aux_levels[i], aw, ah,
+                aux_levels[i]->ne[2], aux_levels[i]->ne[3],
                 GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS);
             perception_map = ggml_concat(ctx0, perception_map, level, 2);
         }
         perception_map = ggml_cont(ctx0, ggml_permute(ctx0, perception_map, 1, 2, 0, 3));
-        ggml_tensor * perception = roi_align(ctx0, perception_map, boxes, aw, ah, 14, n_tokens,
+        ggml_tensor * perception = ggml_roi_align(ctx0, perception_map, boxes, 14, 14,
             0.25f, 0.25f);
-        perception = ggml_reshape_3d(ctx0, perception, 3840, 14 * 14, n_tokens);
-        perception = ggml_cont(ctx0, ggml_permute(ctx0, perception, 1, 0, 2, 3));
-        perception = ggml_cont_2d(ctx0, ggml_mean(ctx0, perception), 3840, n_tokens);
         region = ggml_concat(ctx0, perception, semantic, 0);
         region = ggml_add(ctx0, region, bbox_pos);
     }

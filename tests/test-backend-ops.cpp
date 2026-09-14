@@ -5247,6 +5247,50 @@ struct test_rope : public test_case {
     }
 };
 
+// GGML_OP_ROI_ALIGN
+struct test_roi_align : public test_case {
+    const std::array<int64_t, 4> ne_input;
+    const int n_rois;
+    const int pooled_width;
+    const int pooled_height;
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne_input, n_rois, pooled_width, pooled_height);
+    }
+
+    test_roi_align(
+            std::array<int64_t, 4> ne_input = {5, 7, 6, 1},
+            int n_rois = 3,
+            int pooled_width = 4,
+            int pooled_height = 3)
+        : ne_input(ne_input), n_rois(n_rois), pooled_width(pooled_width), pooled_height(pooled_height) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_input.data());
+        ggml_set_name(input, "input");
+
+        ggml_tensor * boxes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_rois);
+        ggml_set_name(boxes, "boxes");
+
+        ggml_tensor * out = ggml_roi_align(ctx, input, boxes, pooled_width, pooled_height, 1.0f, 1.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        ggml_tensor * boxes = ggml_get_tensor(ctx, "boxes");
+        std::vector<float> data(4 * n_rois);
+        for (int i = 0; i < n_rois; ++i) {
+            data[4*i + 0] = 0.25f * i;
+            data[4*i + 1] = 0.20f * i;
+            data[4*i + 2] = ne_input[1] - 0.25f * i;
+            data[4*i + 3] = ne_input[2] - 0.20f * i;
+        }
+        ggml_backend_tensor_set(boxes, data.data(), 0, data.size() * sizeof(float));
+    }
+};
+
 // GGML_OP_POOL2D
 struct test_pool2d : public test_case {
     enum ggml_op_pool pool_type;
@@ -8186,6 +8230,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    test_cases.emplace_back(new test_roi_align());
+
     for (ggml_type type_input : {GGML_TYPE_F32}) {
         for (ggml_op_pool pool_type : {GGML_OP_POOL_AVG, GGML_OP_POOL_MAX}) {
             for (int k0 : {1, 3}) {
@@ -8504,6 +8550,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type kernel_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         test_cases.emplace_back(new test_conv_transpose_2d({3, 2, 3, 1}, {2, 2, 1, 3}, 1, kernel_type));
+        test_cases.emplace_back(new test_conv_transpose_2d({7, 5, 13, 1}, {2, 2, 11, 13}, 2, kernel_type));
+        test_cases.emplace_back(new test_conv_transpose_2d({4, 3, 5, 2}, {2, 2, 7, 5}, 2, kernel_type));
         test_cases.emplace_back(new test_conv_transpose_2d({10, 10, 9, 1}, {3, 3, 1, 9}, 2, kernel_type));
         test_cases.emplace_back(new test_conv_transpose_2d({129, 63, 35, 1}, {3, 3, 48, 35}, 1, kernel_type));
     }
@@ -9776,6 +9824,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // VLM-FO1 semantic and perception feature maps.
+    test_cases.emplace_back(new test_roi_align({2048, 18, 18, 1}, 100, 14, 14));
+    test_cases.emplace_back(new test_roi_align({3840, 72, 72, 1}, 100, 14, 14));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

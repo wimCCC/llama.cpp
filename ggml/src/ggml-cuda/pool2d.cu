@@ -92,3 +92,59 @@ void ggml_cuda_op_pool2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     pool2d_nchw_kernel_f32_f32_cuda(IH, IW, OH, OW, k1, k0, s1, s0, p1, p0, parallel_elements, src0_d, dst_d, op, stream);
 }
+
+static __global__ void roi_align_f32(
+        const float * src, const float * boxes, float * dst,
+    int64_t channels, int64_t width, int64_t height, int64_t pooled_width, int64_t pooled_height,
+        float spatial_scale_x, float spatial_scale_y, int64_t total) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) {
+        return;
+    }
+
+    const int64_t c = i % channels;
+    const int64_t bin = (i / channels) % (pooled_width * pooled_height);
+    const int64_t roi = i / (channels * pooled_width * pooled_height);
+    const int64_t bx = bin % pooled_width;
+    const int64_t by = bin / pooled_width;
+    const float * box = boxes + 4 * roi;
+    const float x0 = box[0] * spatial_scale_x;
+    const float y0 = box[1] * spatial_scale_y;
+    const float x1 = box[2] * spatial_scale_x;
+    const float y1 = box[3] * spatial_scale_y;
+    const float x = max(0.0f, min((float) (width - 1),
+        x0 + (bx + 0.5f) * (x1 - x0) / pooled_width - 0.5f));
+    const float y = max(0.0f, min((float) (height - 1),
+        y0 + (by + 0.5f) * (y1 - y0) / pooled_height - 0.5f));
+    const int64_t xa = (int64_t) floorf(x);
+    const int64_t ya = (int64_t) floorf(y);
+    const int64_t xb = min(xa + 1, width - 1);
+    const int64_t yb = min(ya + 1, height - 1);
+    const float wx = x - xa;
+    const float wy = y - ya;
+    const float v00 = src[c + channels * (xa + width * ya)];
+    const float v10 = src[c + channels * (xb + width * ya)];
+    const float v01 = src[c + channels * (xa + width * yb)];
+    const float v11 = src[c + channels * (xb + width * yb)];
+
+    dst[i] = (1.0f - wy) * ((1.0f - wx) * v00 + wx * v10)
+           + wy * ((1.0f - wx) * v01 + wx * v11);
+}
+
+void ggml_cuda_op_roi_align(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src   = dst->src[0];
+    const ggml_tensor * boxes = dst->src[1];
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(boxes->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(boxes));
+    GGML_ASSERT(src->ne[3] == 1 && boxes->ne[0] == 4);
+
+    const int64_t total = ggml_nelements(dst);
+    const int num_blocks = (total + CUDA_POOL2D_BLOCK_SIZE - 1) / CUDA_POOL2D_BLOCK_SIZE;
+    roi_align_f32<<<num_blocks, CUDA_POOL2D_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) src->data, (const float *) boxes->data, (float *) dst->data,
+        src->ne[0], src->ne[1], src->ne[2], dst->ne[1], dst->ne[2],
+        ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1), total);
+}

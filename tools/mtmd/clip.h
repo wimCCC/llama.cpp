@@ -95,10 +95,16 @@ struct clip_encode_params {
     int n_threads = 1;
     const clip_image_f32_batch * imgs = nullptr;
     std::vector<float> * out_embd = nullptr;
+    float ** out_embd_pinned = nullptr;
+    float ** out_embd_pinned_scratch = nullptr;
     // Optional Qwen vision feature map, before multimodal projection.
     std::vector<float> * out_feature_map = nullptr;
+    ggml_tensor ** out_feature_map_tensor = nullptr;
+    ggml_backend_t * out_feature_map_backend = nullptr;
     // Optional Qwen feature map supplied to a composite FO1 graph.
     const std::vector<float> * input_feature_map = nullptr;
+    const ggml_tensor * input_feature_map_tensor = nullptr;
+    ggml_backend_t input_feature_map_backend = nullptr;
     int input_feature_map_width = 0;
     int input_feature_map_height = 0;
     // Optional VLM-FO1 region boxes in image pixel coordinates (xyxy).

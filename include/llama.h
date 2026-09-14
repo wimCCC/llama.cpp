@@ -584,6 +584,14 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 
+        // Copy a contiguous range of token embeddings to a caller-owned F32 buffer.
+        // Returns false if the range is invalid or the model has no token embeddings.
+        LLAMA_API bool llama_model_get_token_embeddings(
+            const struct llama_model * model,
+            llama_token first_token,
+            int32_t n_tokens,
+            float * out);
+
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 

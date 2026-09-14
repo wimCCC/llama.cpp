@@ -67,6 +67,36 @@ static __global__ void conv2d_transpose_kernel(const float * __restrict__ input,
     output[(out_w * out_h * c_out) * n_idx + (out_w * out_h) * c_idx + (out_w) *out_y_idx + out_x_idx] = accumulator;
 }
 
+static __global__ void convert_f32_to_f16(const float * input, half * output, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        output[i] = input[i];
+    }
+}
+
+static __global__ void conv2d_transpose_2x2_pixel_shuffle(
+        const float * __restrict__ patches,
+        float * __restrict__ output,
+        int in_w,
+        int in_h,
+        int c_out,
+        int64_t total) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) {
+        return;
+    }
+
+    const int out_w = 2 * in_w;
+    const int out_h = 2 * in_h;
+    const int out_x = i % out_w;
+    const int out_y = (i / out_w) % out_h;
+    const int c = i / ((int64_t) out_w * out_h);
+    const int x = out_x / 2;
+    const int y = out_y / 2;
+    const int q = 2 * (out_y % 2) + out_x % 2;
+    output[i] = patches[q + 4 * (c + c_out * (x + in_w * y))];
+}
+
 //input is (W, H, C_in, N), Kernel is (W, H, C_out, C_in)
 void ggml_cuda_conv_2d_transpose_p0(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * kernel = dst->src[0];
@@ -99,8 +129,44 @@ void ggml_cuda_conv_2d_transpose_p0(ggml_backend_cuda_context & ctx, ggml_tensor
     GGML_ASSERT(ggml_is_contiguous(kernel));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
-    const int total  = output_w * output_h * channels_out * batches;
+    const bool use_2x2_stride_2 = batches == 1 && kernel_w == 2 && kernel_h == 2 && stride == 2 &&
+        output_w == 2 * input_w && output_h == 2 * input_h;
+    const int total = output_w * output_h * channels_out * batches;
     const int blocks = (total + CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE - 1) / CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE;
+
+    if (use_2x2_stride_2) {
+        const int spatial = input_w * input_h;
+        const int patch_channels = 4 * channels_out;
+        ggml_cuda_pool_alloc<float> patches(ctx.pool(), (size_t) patch_channels * spatial);
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublasHandle_t handle = ctx.cublas_handle();
+        CUBLAS_CHECK(cublasSetStream(handle, st));
+
+        if (kernel->type == GGML_TYPE_F16) {
+            ggml_cuda_pool_alloc<half> input_f16(ctx.pool(), (size_t) spatial * channels_in);
+            const int input_blocks = (spatial * channels_in + CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE - 1) /
+                CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE;
+            convert_f32_to_f16<<<input_blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
+                input_data, input_f16.get(), (int64_t) spatial * channels_in);
+            CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                patch_channels, spatial, channels_in,
+                &alpha, kernel_data, CUDA_R_16F, patch_channels,
+                        input_f16.get(), CUDA_R_16F, spatial,
+                &beta, patches.get(), CUDA_R_32F, patch_channels,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        } else {
+            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                patch_channels, spatial, channels_in,
+                &alpha, (const float *) kernel_data, patch_channels,
+                        input_data, spatial,
+                &beta, patches.get(), patch_channels));
+        }
+
+        conv2d_transpose_2x2_pixel_shuffle<<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
+            patches.get(), output_data, input_w, input_h, channels_out, total);
+        return;
+    }
 
     if (kernel->type == GGML_TYPE_F16) {
         conv2d_transpose_kernel<half><<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(

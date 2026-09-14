@@ -180,6 +180,10 @@ ggml_cgraph * clip_graph_qwen2vl::build() {
     // unmerged 1280-channel map; the following reshape performs Qwen's normal
     // 2x2 token merger and must not be used as the region-feature source.
     ggml_set_name(inpL, "qwen2vl_feature_map");
+    if (encode_params &&
+        (encode_params->out_feature_map != nullptr || encode_params->out_feature_map_tensor != nullptr)) {
+        ggml_set_output(inpL);
+    }
 
     // multimodal projection
     ggml_tensor * embeddings = inpL;

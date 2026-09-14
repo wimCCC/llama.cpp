@@ -107,16 +107,6 @@ private:
     bool enabled_;
 };
 
-static llama_token mtmd_find_fo1_region0(const llama_vocab * vocab) {
-    for (llama_token token = 0; token < llama_vocab_n_tokens(vocab); ++token) {
-        const char * text = llama_vocab_get_text(vocab, token);
-        if (text != nullptr && std::string(text) == "<region0>") {
-            return token;
-        }
-    }
-    return -1;
-}
-
 // Helper function for decoding an image whose embeddings have already been calculated
 int32_t mtmd_helper_decode_image_chunk(
         mtmd_context * ctx,
@@ -228,27 +218,12 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
     auto chunk_type = mtmd_input_chunk_get_type(chunk);
 
     if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
-        const llama_token region0 = mtmd_is_fo1(ctx) ? mtmd_find_fo1_region0(llama_model_get_vocab(llama_get_model(lctx))) : -1;
+        const llama_token region0 = mtmd_get_fo1_region0_token(ctx);
         size_t n_tokens;
         const auto tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
-        auto decode_region = [&](int region) -> int32_t {
-            const float * region_embd = mtmd_get_fo1_output_embd(ctx);
-            const int n_regions = mtmd_get_fo1_n_tokens(ctx);
-            if (!region_embd || region < 0 || region >= n_regions) {
-                LOG_ERR("FO1 region embedding is unavailable for region %d\n", region);
-                return 1;
-            }
-            decode_embd_batch batch(const_cast<float *>(region_embd) +
-                (size_t) region * n_mmproj_embd, 1, 1, n_mmproj_embd);
-            batch.set_position_normal(n_past, seq_id);
-            const int32_t result = llama_decode(lctx, batch.batch);
-            if (result != 0) {
-                return result;
-            }
-            n_past++;
-            (*new_n_past)++;
-            return 0;
-        };
+        const float * region_embd = mtmd_get_fo1_output_embd(ctx);
+        const float * region_marker_embd = mtmd_get_fo1_marker_embd(ctx);
+        const int n_regions = mtmd_get_fo1_n_tokens(ctx);
         size_t i = 0;
         while (i < n_tokens) { // split into batches
             text_batch.n_tokens = 0; // clear the batch
@@ -278,28 +253,45 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
                     return ret;
                 }
                 *new_n_past += text_batch.n_tokens;
-                n_past += text_batch.n_tokens;
             }
 
             if (i < n_tokens) {
-                const int region = region0 >= 0 ? (int) tokens[i] - region0 : -1;
-                text_batch.n_tokens = 1;
-                text_batch.token[0] = tokens[i++];
-                text_batch.pos[0] = n_past++;
-                text_batch.n_seq_id[0] = 1;
-                text_batch.seq_id[0][0] = seq_id;
-                text_batch.logits[0] = false;
-                ret = llama_decode(lctx, text_batch);
+                const size_t first = i;
+                while (i < n_tokens) {
+                    const int region = region0 >= 0 ? (int) tokens[i] - region0 : -1;
+                    if (region < 0 || region >= n_regions) {
+                        break;
+                    }
+                    ++i;
+                }
+
+                const int32_t count = (int32_t) (i - first);
+                if (!region_embd || count <= 0) {
+                    LOG_ERR("FO1 region embedding is unavailable\n");
+                    llama_batch_free(text_batch);
+                    return 1;
+                }
+
+                std::vector<float> interleaved((size_t) count * 2 * n_mmproj_embd);
+                for (int32_t j = 0; j < count; ++j) {
+                    const int region = (int) tokens[first + j] - region0;
+                    memcpy(interleaved.data() + (size_t) (2 * j) * n_mmproj_embd,
+                        region_marker_embd + (size_t) region * n_mmproj_embd,
+                        (size_t) n_mmproj_embd * sizeof(float));
+                    memcpy(interleaved.data() + (size_t) (2 * j + 1) * n_mmproj_embd,
+                        region_embd + (size_t) region * n_mmproj_embd,
+                        (size_t) n_mmproj_embd * sizeof(float));
+                }
+
+                decode_embd_batch batch(interleaved.data(), count * 2, 1, n_mmproj_embd);
+                batch.set_position_normal(n_past, seq_id);
+                ret = llama_decode(lctx, batch.batch);
                 if (ret != 0) {
                     llama_batch_free(text_batch);
                     return ret;
                 }
-                (*new_n_past)++;
-                ret = decode_region(region);
-                if (ret != 0) {
-                    llama_batch_free(text_batch);
-                    return ret;
-                }
+                n_past += count * 2;
+                *new_n_past += count * 2;
             }
         }
         *new_n_past = n_past;

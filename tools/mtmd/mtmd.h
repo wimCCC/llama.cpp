@@ -310,6 +310,9 @@ MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
 MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
 
 MTMD_API const float * mtmd_get_fo1_output_embd(const mtmd_context * ctx);
+MTMD_API float * mtmd_get_fo1_interleaved_embd(mtmd_context * ctx);
+MTMD_API const float * mtmd_get_fo1_marker_embd(const mtmd_context * ctx);
+MTMD_API llama_token   mtmd_get_fo1_region0_token(const mtmd_context * ctx);
 MTMD_API int32_t mtmd_get_fo1_n_tokens(const mtmd_context * ctx);
 MTMD_API bool mtmd_is_fo1(const mtmd_context * ctx);
 

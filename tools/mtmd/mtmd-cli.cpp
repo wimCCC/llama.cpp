@@ -199,10 +199,11 @@ struct mtmd_cli_context {
     }
 };
 
-static int generate_response(mtmd_cli_context & ctx, int n_predict) {
-    const int64_t generation_start_ms = ggml_time_ms();
-    int64_t first_token_ms = -1;
-    int64_t generation_end_ms = generation_start_ms;
+static int generate_response(mtmd_cli_context & ctx, int n_predict, int64_t request_start_us) {
+    const int64_t generation_start_us = ggml_time_us();
+    int64_t first_token_us = -1;
+    int64_t last_token_us = generation_start_us;
+    llama_perf_context_data perf_at_first_token = {};
     llama_tokens generated_tokens;
     for (int i = 0; i < n_predict; i++) {
         if (i > n_predict || !g_is_generating || g_is_interrupted) {
@@ -211,9 +212,11 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
         }
 
         llama_token token_id = common_sampler_sample(ctx.smpl, ctx.lctx, -1);
-        if (first_token_ms < 0) {
-            first_token_ms = ggml_time_ms();
+        if (first_token_us < 0) {
+            first_token_us = ggml_time_us();
+            perf_at_first_token = llama_perf_context(ctx.lctx);
         }
+        last_token_us = ggml_time_us();
         generated_tokens.push_back(token_id);
         common_sampler_accept(ctx.smpl, token_id, true);
 
@@ -237,7 +240,6 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
             LOG_ERR("failed to decode token\n");
             return 1;
         }
-        generation_end_ms = ggml_time_ms();
     }
 
     std::string generated_text = common_detokenize(ctx.lctx, generated_tokens);
@@ -246,13 +248,21 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
     msg.content = generated_text;
     ctx.chat_history.push_back(std::move(msg));
 
-    if (first_token_ms >= 0) {
-        const double ttft_ms = (double) (first_token_ms - generation_start_ms);
+    if (first_token_us >= 0) {
+        llama_synchronize(ctx.lctx);
+        const llama_perf_context_data perf_after_generation = llama_perf_context(ctx.lctx);
         const int n_generated = (int) generated_tokens.size();
-        const double decode_ms = (double) (generation_end_ms - first_token_ms);
-        const double tpot_ms = n_generated > 1 ? decode_ms / (n_generated - 1) : 0.0;
-        LOG_INF("generation: tokens=%d, TTFT=%.2f ms, TPOT=%.2f ms/token, generation=%.2f ms\n",
-            n_generated, ttft_ms, tpot_ms, (double) (generation_end_ms - generation_start_ms));
+        const double prefill_ms = (generation_start_us - request_start_us) / 1000.0;
+        const double ttft_decode_ms = (first_token_us - generation_start_us) / 1000.0;
+        const double ttft_e2e_ms = (first_token_us - request_start_us) / 1000.0;
+        const double inter_token_ms = (last_token_us - first_token_us) / 1000.0;
+        const double tpot_e2e_ms = n_generated > 1 ? inter_token_ms / (n_generated - 1) : 0.0;
+        const double decode_ms = perf_after_generation.t_eval_ms - perf_at_first_token.t_eval_ms;
+        const int32_t n_eval = perf_after_generation.n_eval - perf_at_first_token.n_eval;
+        const double tpot_decode_ms = n_eval > 0 ? decode_ms / n_eval : 0.0;
+        LOG_INF("generation: tokens=%d, TTFT_e2e=%.2f ms, prefill=%.2f ms, TTFT_decode=%.2f ms, TPOT_decode=%.2f ms/token, TPOT_e2e=%.2f ms/token, generation=%.2f ms\n",
+            n_generated, ttft_e2e_ms, prefill_ms, ttft_decode_ms, tpot_decode_ms, tpot_e2e_ms,
+            (last_token_us - generation_start_us) / 1000.0);
     }
 
     return 0;
@@ -463,6 +473,7 @@ int main(int argc, char ** argv) {
     }
 
     if (is_single_turn) {
+        const int64_t request_start_us = ggml_time_us();
         g_is_generating = true;
         if (params.prompt.find(mtmd_default_marker()) == std::string::npos) {
             for (size_t i = 0; i < params.image.size(); i++) {
@@ -483,7 +494,7 @@ int main(int argc, char ** argv) {
         if (eval_message(ctx, msg)) {
             return 1;
         }
-        if (!g_is_interrupted && generate_response(ctx, n_predict)) {
+        if (!g_is_interrupted && generate_response(ctx, n_predict, request_start_us)) {
             return 1;
         }
         llama_perf_context_print(ctx.lctx);
@@ -552,12 +563,13 @@ int main(int argc, char ** argv) {
             common_chat_msg msg;
             msg.role = "user";
             msg.content = content;
+            const int64_t request_start_us = ggml_time_us();
             int ret = eval_message(ctx, msg);
             if (ret) {
                 return 1;
             }
             if (g_is_interrupted) break;
-            if (generate_response(ctx, n_predict)) {
+            if (generate_response(ctx, n_predict, request_start_us)) {
                 return 1;
             }
             content.clear();

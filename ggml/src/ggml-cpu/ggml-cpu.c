@@ -1953,6 +1953,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_pool_2d_back(params, tensor);
             } break;
+        case GGML_OP_ROI_ALIGN:
+            {
+                ggml_compute_forward_roi_align(params, tensor);
+            } break;
         case GGML_OP_UPSCALE:
             {
                 ggml_compute_forward_upscale(params, tensor);
@@ -2386,6 +2390,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_POOL_2D_BACK:
             {
                 n_tasks = 1;
+            } break;
+        case GGML_OP_ROI_ALIGN:
+            {
+                n_tasks = n_threads;
             } break;
         case GGML_OP_UPSCALE:
         case GGML_OP_PAD:

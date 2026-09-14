@@ -1113,8 +1113,8 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             GGML_ABORT("missing cgraph builder");
     }
 
-    builder->img_batch = &imgs;
     builder->encode_params = params;
+    builder->img_batch = &imgs;
 
     // TODO [QWEN_VIDEO]: improve this in the future
     builder->n_batch = imgs.entries.size();
@@ -2473,29 +2473,34 @@ struct clip_model_loader {
                     model.aux_fpn_levels.resize(4);
                     for (int level = 1; level <= 4; ++level) {
                         const std::string prefix = string_format("fo1.fpn.simfp_%d.", level);
-                        auto load_conv = [&](int module, ggml_tensor * & weight, ggml_tensor * & bias,
-                                             ggml_tensor * & norm_w, ggml_tensor * & norm_b) {
-                            weight = get_tensor(string_format("%s%d.weight", prefix.c_str(), module));
-                            bias = get_tensor(string_format("%s%d.bias", prefix.c_str(), module), false);
-                            norm_w = get_tensor(string_format("%s%d.norm.weight", prefix.c_str(), module), false);
-                            norm_b = get_tensor(string_format("%s%d.norm.bias", prefix.c_str(), module), false);
+                        auto tensor = [&](int module, const char * suffix) {
+                            return get_tensor(string_format("%s%d.%s", prefix.c_str(), module, suffix), false);
                         };
                         auto & fpn = model.aux_fpn_levels[level - 1];
                         if (level == 1) {
-                            load_conv(0, fpn.resize_w, fpn.resize_b, fpn.resize_norm_w, fpn.resize_norm_b);
-                            load_conv(3, fpn.resize2_w, fpn.resize2_b, fpn.resize2_norm_w, fpn.resize2_norm_b);
-                            load_conv(4, fpn.proj_w, fpn.proj_b, fpn.proj_norm_w, fpn.proj_norm_b);
-                            load_conv(5, fpn.out_w, fpn.out_b, fpn.out_norm_w, fpn.out_norm_b);
+                            fpn.resize_w = tensor(0, "weight"); fpn.resize_b = tensor(0, "bias");
+                            fpn.resize2_w = tensor(3, "weight"); fpn.resize2_b = tensor(3, "bias");
+                            // Module 3 is the second stride-2 resize layer.
+                            fpn.proj_w = tensor(4, "weight"); fpn.proj_b = tensor(4, "bias");
+                            fpn.proj_norm_w = tensor(4, "norm.weight"); fpn.proj_norm_b = tensor(4, "norm.bias");
+                            fpn.out_w = tensor(5, "weight"); fpn.out_b = tensor(5, "bias");
+                            fpn.out_norm_w = tensor(5, "norm.weight"); fpn.out_norm_b = tensor(5, "norm.bias");
                         } else if (level == 2) {
-                            load_conv(0, fpn.resize_w, fpn.resize_b, fpn.resize_norm_w, fpn.resize_norm_b);
-                            load_conv(1, fpn.proj_w, fpn.proj_b, fpn.proj_norm_w, fpn.proj_norm_b);
-                            load_conv(2, fpn.out_w, fpn.out_b, fpn.out_norm_w, fpn.out_norm_b);
+                            fpn.resize_w = tensor(0, "weight"); fpn.resize_b = tensor(0, "bias");
+                            fpn.proj_w = tensor(1, "weight"); fpn.proj_b = tensor(1, "bias");
+                            fpn.proj_norm_w = tensor(1, "norm.weight"); fpn.proj_norm_b = tensor(1, "norm.bias");
+                            fpn.out_w = tensor(2, "weight"); fpn.out_b = tensor(2, "bias");
+                            fpn.out_norm_w = tensor(2, "norm.weight"); fpn.out_norm_b = tensor(2, "norm.bias");
                         } else if (level == 3) {
-                            load_conv(0, fpn.proj_w, fpn.proj_b, fpn.proj_norm_w, fpn.proj_norm_b);
-                            load_conv(1, fpn.out_w, fpn.out_b, fpn.out_norm_w, fpn.out_norm_b);
+                            fpn.proj_w = tensor(0, "weight"); fpn.proj_b = tensor(0, "bias");
+                            fpn.proj_norm_w = tensor(0, "norm.weight"); fpn.proj_norm_b = tensor(0, "norm.bias");
+                            fpn.out_w = tensor(1, "weight"); fpn.out_b = tensor(1, "bias");
+                            fpn.out_norm_w = tensor(1, "norm.weight"); fpn.out_norm_b = tensor(1, "norm.bias");
                         } else {
-                            load_conv(1, fpn.proj_w, fpn.proj_b, fpn.proj_norm_w, fpn.proj_norm_b);
-                            load_conv(2, fpn.out_w, fpn.out_b, fpn.out_norm_w, fpn.out_norm_b);
+                            fpn.proj_w = tensor(1, "weight"); fpn.proj_b = tensor(1, "bias");
+                            fpn.proj_norm_w = tensor(1, "norm.weight"); fpn.proj_norm_b = tensor(1, "norm.bias");
+                            fpn.out_w = tensor(2, "weight"); fpn.out_b = tensor(2, "bias");
+                            fpn.out_norm_w = tensor(2, "norm.weight"); fpn.out_norm_b = tensor(2, "norm.bias");
                         }
                     }
                     model.mm_0_w = get_tensor("fo1.proj.0.weight");
@@ -4362,20 +4367,9 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
         case PROJECTOR_TYPE_POCKETTTS_GEN: return list_pockettts_state_slots(hparams, model);
         default:                           return {};
     }
-
 }
 
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
-    if (ctx->model.proj_type == PROJECTOR_TYPE_VLM_FO1_AUX) {
-        if (params->bbox != nullptr) {
-            const size_t expected = (size_t) ctx->model.hparams.n_region_tokens * 4;
-            if (params->bbox->size() != expected) {
-                LOG_ERR("%s: VLM-FO1 auxiliary bbox input has %zu values; expected %zu\n",
-                    __func__, params->bbox->size(), expected);
-                return false;
-            }
-        }
-    }
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
@@ -4398,10 +4392,6 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
-    if (gf == nullptr) {
-        LOG_ERR("%s: failed to build the projector graph\n", __func__);
-        return false;
-    }
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
 
     // set inputs
@@ -4528,10 +4518,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 }
             }
         }
-        if (ggml_graph_get_tensor(gf, "inp_raw") != nullptr) {
-            set_input_f32("inp_raw", inp_raw);
-        }
-
+        set_input_f32("inp_raw", inp_raw);
         if (params->input_feature_map != nullptr) {
             set_input_f32("qwen2vl_feature_map", *params->input_feature_map);
         }
@@ -4552,37 +4539,23 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // set input per projector
     switch (ctx->model.proj_type) {
         case PROJECTOR_TYPE_VLM_FO1_AUX:
-            if (ggml_graph_get_tensor(gf, "bbox") != nullptr) {
-                if (params->bbox) {
-                    const ggml_tensor * bbox = get_inp_tensor("bbox");
-                    if (params->bbox->size() != (size_t) ggml_nelements(bbox)) {
-                        LOG_ERR("%s: bbox has %zu values, expected %zu\n", __func__,
-                            params->bbox->size(), (size_t) ggml_nelements(bbox));
+            {
+                const ggml_tensor * bbox = ggml_graph_get_tensor(gf, "bbox");
+                const ggml_tensor * bbox_pos = ggml_graph_get_tensor(gf, "bbox_pos");
+                if (bbox != nullptr) {
+                    if (params->bbox == nullptr || params->bbox->size() != (size_t) ggml_nelements(bbox)) {
+                        LOG_ERR("%s: invalid FO1 bbox input\n", __func__);
                         return false;
                     }
                     set_input_f32("bbox", *params->bbox);
-                } else {
-                    const ggml_tensor * bbox = get_inp_tensor("bbox");
-                    const int n = bbox->ne[1];
-                    std::vector<float> full_image((size_t) n * 4);
-                    for (int i = 0; i < n; ++i) {
-                        full_image[4*i + 0] = 0.0f;
-                        full_image[4*i + 1] = 0.0f;
-                        full_image[4*i + 2] = (float) image_size_width;
-                        full_image[4*i + 3] = (float) image_size_height;
+                }
+                if (bbox_pos != nullptr) {
+                    if (params->bbox_pos == nullptr || params->bbox_pos->size() != (size_t) ggml_nelements(bbox_pos)) {
+                        LOG_ERR("%s: invalid FO1 bbox positional input\n", __func__);
+                        return false;
                     }
-                    set_input_f32("bbox", full_image);
+                    set_input_f32("bbox_pos", *params->bbox_pos);
                 }
-            }
-            if (ggml_graph_get_tensor(gf, "bbox_pos") != nullptr) {
-                const ggml_tensor * bbox_pos = get_inp_tensor("bbox_pos");
-                const size_t expected = (size_t) ggml_nelements(bbox_pos);
-                if (params->bbox_pos == nullptr || params->bbox_pos->size() != expected) {
-                    LOG_ERR("%s: bbox_pos has %zu values, expected %zu\n", __func__,
-                        params->bbox_pos ? params->bbox_pos->size() : 0, expected);
-                    return false;
-                }
-                set_input_f32("bbox_pos", *params->bbox_pos);
             }
             break;
         case PROJECTOR_TYPE_MUSE_GLIMMER:
